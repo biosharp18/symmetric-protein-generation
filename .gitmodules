@@ -1,0 +1,3 @@
+[submodule "models/rfdiffusion"]
+	path = models/rfdiffusion
+	url = git@github.com:biosharp18/RFdiffusion-symm.git
