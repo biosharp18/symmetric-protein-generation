@@ -1,0 +1,13 @@
+name: sym_prot_eval
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - numpy
+  - scipy
+  - mdtraj
+  - pandas
+  - pip
+  - tqdm
+  - pip:
+    - tmtools
