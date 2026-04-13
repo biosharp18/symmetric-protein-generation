@@ -24,11 +24,10 @@ import json
 import sys
 import time
 from pathlib import Path
-from collections import defaultdict
 
 import numpy as np
 
-from metrics import per_sample_metrics, extract_ca_coords, diversity_score
+from metrics import per_sample_metrics, extract_ca_coords, diversity_score, self_consistency_metrics
 
 
 def find_pdb_files(sample_dir: str, pdb_glob: str = "**/*.pdb") -> list[Path]:
@@ -69,7 +68,16 @@ def aggregate_metrics(per_sample: list[dict]) -> dict:
     return agg
 
 
-def evaluate_directory(sample_dir: str, pdb_glob: str, skip_diversity: bool = False) -> dict:
+def evaluate_directory(
+    sample_dir: str,
+    pdb_glob: str,
+    skip_diversity: bool = False,
+    self_consistency: bool = False,
+    folding_model=None,
+    pmpnn_dir: str = None,
+    num_seqs: int = 8,
+    sampling_temp: float = 0.1,
+) -> dict:
     """Run full evaluation on a directory of PDB samples."""
     pdb_files = find_pdb_files(sample_dir, pdb_glob)
     if not pdb_files:
@@ -110,11 +118,65 @@ def evaluate_directory(sample_dir: str, pdb_glob: str, skip_diversity: bool = Fa
         print(f"    Diversity TM-score mean: {div['diversity_tm_mean']:.4f} "
               f"({div['num_pairs']} pairs, {dt:.1f}s)")
 
+    # Self-consistency (ProteinMPNN → ESMFold → scTM/scRMSD)
+    sc_results = {}
+    if self_consistency:
+        print("  Computing self-consistency (ProteinMPNN + ESMFold)...")
+        sc_output_base = Path(sample_dir) / "self_consistency"
+        sc_output_base.mkdir(parents=True, exist_ok=True)
+        t0 = time.time()
+        sc_per_sample = []
+        for i, pdb_path in enumerate(pdb_files):
+            sc_output_dir = str(sc_output_base / pdb_path.stem)
+            try:
+                sc = self_consistency_metrics(
+                    str(pdb_path),
+                    folding_model=folding_model,
+                    pmpnn_dir=pmpnn_dir,
+                    sc_output_dir=sc_output_dir,
+                    num_seqs=num_seqs,
+                    sampling_temp=sampling_temp,
+                )
+                sc_per_sample.append(sc)
+                # Attach to the corresponding per_sample entry
+                if i < len(per_sample):
+                    per_sample[i].update(sc)
+                print(f"    [{i+1}/{len(pdb_files)}] {pdb_path.name}: "
+                      f"scTM={sc['sc_tm']:.3f}, scRMSD={sc['sc_rmsd']:.2f}")
+            except Exception as e:
+                print(f"    WARN: SC failed on {pdb_path.name}: {e}")
+        dt = time.time() - t0
+
+        # Aggregate SC metrics
+        if sc_per_sample:
+            valid_tms = [s["sc_tm"] for s in sc_per_sample if not np.isnan(s["sc_tm"])]
+            valid_rmsds = [s["sc_rmsd"] for s in sc_per_sample if not np.isnan(s["sc_rmsd"])]
+            if valid_tms:
+                designable = [t for t in valid_tms if t > 0.5]
+                sc_results = {
+                    "sc_tm_mean": float(np.mean(valid_tms)),
+                    "sc_tm_std": float(np.std(valid_tms)),
+                    "sc_rmsd_mean": float(np.mean(valid_rmsds)),
+                    "sc_rmsd_std": float(np.std(valid_rmsds)),
+                    "designability_rate": len(designable) / len(valid_tms),
+                    "num_designable_TM": len(designable),
+                    "num_designable_RMSD": len([r for r in valid_rmsds if r < 2.0]),
+                    "num_evaluated": len(valid_tms),
+                }
+                print(f"    scTM: {sc_results['sc_tm_mean']:.4f} ± {sc_results['sc_tm_std']:.4f}")
+                print(f"    scRMSD: {sc_results['sc_rmsd_mean']:.2f} ± {sc_results['sc_rmsd_std']:.2f}")
+                print(f"    Designability (scTM>0.5): {sc_results['designability_rate']:.1%} "
+                      f"({sc_results['num_designable_TM']}/{sc_results['num_evaluated']})")
+                print(f"    Designability (scRMSD<2Å): {sc_results['num_designable_RMSD'] / len(valid_rmsds):.1%} "
+                      f"({sc_results['num_designable_RMSD']}/{len(valid_rmsds)})")
+        print(f"    Self-consistency done in {dt:.1f}s")
+
     return {
         "sample_dir": str(Path(sample_dir).resolve()),
         "num_pdbs_found": len(pdb_files),
         "aggregate": agg,
         "diversity": div,
+        "self_consistency": sc_results,
         "per_sample": per_sample,
     }
 
@@ -158,6 +220,15 @@ def print_summary(results: list[dict]):
             rg = agg["radius_of_gyration_nm"]
             print(f"  Radius of gyration (nm):        {rg['mean']:.3f} ± {rg['std']:.3f}")
 
+        sc = r.get("self_consistency", {})
+        if sc:
+            print(f"  scTM (best-of-N, mean):         {sc['sc_tm_mean']:.4f} ± {sc['sc_tm_std']:.4f}")
+            print(f"  scRMSD (best-of-N, mean):       {sc['sc_rmsd_mean']:.2f} ± {sc['sc_rmsd_std']:.2f}")
+            print(f"  Designability (scTM > 0.5):     {sc['designability_rate']:.1%} "
+                  f"({sc['num_designable_TM']}/{sc['num_evaluated']})")
+            print(f"  Designability (scRMSD < 2Å):    {sc['num_designable_RMSD'] / sc['num_evaluated']:.1%} "
+                  f"({sc['num_designable_RMSD']}/{sc['num_evaluated']})")
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -183,12 +254,86 @@ def main():
         action="store_true",
         help="Skip pairwise TM-score diversity computation (slow for large proteins).",
     )
+    parser.add_argument(
+        "--self-consistency",
+        action="store_true",
+        help="Run self-consistency evaluation (ProteinMPNN + ESMFold). Requires GPU.",
+    )
+    parser.add_argument(
+        "--pmpnn-dir",
+        default=None,
+        help="Path to ProteinMPNN directory (default: models/framediff/ProteinMPNN/).",
+    )
+    parser.add_argument(
+        "--num-seqs",
+        type=int,
+        default=8,
+        help="Number of ProteinMPNN sequences per backbone (default: 8).",
+    )
+    parser.add_argument(
+        "--sampling-temp",
+        type=float,
+        default=0.1,
+        help="ProteinMPNN sampling temperature (default: 0.1).",
+    )
+    parser.add_argument(
+        "--gpu",
+        type=int,
+        default=None,
+        help="GPU device index to use for ESMFold (default: auto-select).",
+    )
     args = parser.parse_args()
+
+    # Resolve ProteinMPNN directory
+    if args.pmpnn_dir is None:
+        # Default: relative to this script's repo root
+        repo_root = Path(__file__).resolve().parent.parent
+        args.pmpnn_dir = str(repo_root / "models" / "framediff" / "ProteinMPNN")
+    if args.self_consistency and not Path(args.pmpnn_dir).is_dir():
+        print(f"ERROR: ProteinMPNN directory not found: {args.pmpnn_dir}")
+        sys.exit(1)
+
+    # Load ESMFold model once if needed
+    folding_model = None
+    if args.self_consistency:
+        print("Loading ESMFold model...")
+        # ESMFold depends on openfold; add FoldFlow's bundled copy to path if needed
+        try:
+            import openfold  # noqa: F401
+        except ImportError:
+            # Look for openfold in common locations
+            candidates = [
+                Path(args.pmpnn_dir).parent,  # models/framediff/
+                Path.home() / "FoldFlow",      # ~/FoldFlow/
+            ]
+            for candidate in candidates:
+                of_path = candidate / "openfold"
+                if of_path.is_dir():
+                    sys.path.insert(0, str(candidate))
+                    break
+        import torch
+        import esm
+        if args.gpu is not None:
+            device = f"cuda:{args.gpu}"
+        elif torch.cuda.is_available():
+            device = "cuda"
+        else:
+            device = "cpu"
+        folding_model = esm.pretrained.esmfold_v1().eval().to(device)
+        print(f"  ESMFold loaded on {device}")
 
     results = []
     for d in args.sample_dirs:
         print(f"\nEvaluating: {d}")
-        r = evaluate_directory(d, args.pdb_glob, skip_diversity=args.skip_diversity)
+        r = evaluate_directory(
+            d, args.pdb_glob,
+            skip_diversity=args.skip_diversity,
+            self_consistency=args.self_consistency,
+            folding_model=folding_model,
+            pmpnn_dir=args.pmpnn_dir,
+            num_seqs=args.num_seqs,
+            sampling_temp=args.sampling_temp,
+        )
         results.append(r)
 
     print_summary(results)

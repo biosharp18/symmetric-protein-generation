@@ -11,3 +11,9 @@ dependencies:
   - tqdm
   - pip:
     - tmtools
+    - torch
+    - "fair-esm[esmfold]"
+    - biotite
+    - biopython
+    - pyyaml
+    - omegaconf
