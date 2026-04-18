@@ -119,6 +119,62 @@ def run_foldseek_multimer(pdb_path: str, output_dir: str, label: str = "complex"
     return best_tm if best_tm > 0 else None
 
 
+def compute_pairwise_diversity(pdb_paths: list[str]) -> dict | None:
+    """Mean pairwise TM-score across a set of PDBs (the run's "diversity" metric).
+
+    Loads each PDB's CA coordinates and runs tmtools.tm_align on every unordered
+    pair, using max(tm_norm_chain1, tm_norm_chain2) to match scTM's symmetric
+    convention. For symmetric assemblies the chains are emitted in a consistent
+    order (A, B, C, ...), so concatenated-CA alignment is equivalent to proper
+    multi-chain TM-align.
+
+    A lower mean_pairwise_tm means more structurally diverse outputs.
+
+    Returns None if fewer than 2 usable PDBs.
+    """
+    import itertools
+    import numpy as np
+    import mdtraj as md
+    from tmtools import tm_align
+
+    entries = []
+    for path in pdb_paths:
+        try:
+            traj = md.load(path)
+            ca_idx = traj.topology.select("name CA")
+            if len(ca_idx) == 0:
+                log.warning(f"Diversity: {path} has no CA atoms, skipping")
+                continue
+            pos = traj.xyz[0, ca_idx] * 10.0  # nm -> A
+            seq = "A" * len(ca_idx)
+            entries.append((path, pos, seq))
+        except Exception as e:
+            log.warning(f"Diversity: failed to load CAs from {path}: {e}")
+
+    if len(entries) < 2:
+        return None
+
+    tms = []
+    for (_, pa, sa), (_, pb, sb) in itertools.combinations(entries, 2):
+        try:
+            res = tm_align(pa, pb, sa, sb)
+            tms.append(float(max(res.tm_norm_chain1, res.tm_norm_chain2)))
+        except Exception as e:
+            log.warning(f"Diversity: tm_align failed: {e}")
+
+    if not tms:
+        return None
+
+    arr = np.array(tms)
+    return {
+        "mean_pairwise_tm": float(arr.mean()),
+        "min_pairwise_tm": float(arr.min()),
+        "max_pairwise_tm": float(arr.max()),
+        "num_pdbs": len(entries),
+        "num_pairs": len(tms),
+    }
+
+
 def compute_clash_score(pdb_path: str, clash_threshold: float = 1.5) -> float | None:
     """Compute steric clashes per 1000 atoms from a PDB file.
 
@@ -161,13 +217,14 @@ def run_self_consistency_generic(
     seq_per_sample: int = 8,
     tied_positions_path: str | None = None,
     fold_fn=None,
+    fold_fn_batch=None,
     gpu_id: int = 0,
     sampling_temp: float = 0.1,
     pmpnn_seed: int = 38,
 ) -> list[dict]:
     """Run ProteinMPNN -> fold -> scTM/scRMSD pipeline.
 
-    This is a generic version that accepts a fold_fn callback.
+    This is a generic version that accepts a fold callback.
     For model-specific self-consistency, the generator can provide
     its own Sampler.run_self_consistency method instead.
 
@@ -177,7 +234,12 @@ def run_self_consistency_generic(
         pmpnn_dir: path to ProteinMPNN repo.
         seq_per_sample: number of ProteinMPNN sequences.
         tied_positions_path: optional tied positions JSONL for symmetric design.
-        fold_fn: callable(sequence, save_path) that folds a sequence to PDB.
+        fold_fn: callable(sequence, save_path) that folds one sequence to PDB.
+            Used when `fold_fn_batch` is None (per-sequence loop).
+        fold_fn_batch: optional callable(list[str], list[str]) that folds all
+            sequences at once (batched ESMFold). If provided, takes precedence
+            over `fold_fn` — the per-sequence loop is replaced by one batched
+            call and a subsequent metrics loop over the written PDBs.
         gpu_id: CUDA device.
 
     Returns:
@@ -239,13 +301,48 @@ def run_self_consistency_generic(
     fold_dir = os.path.join(sc_dir, "esmfold")
     os.makedirs(fold_dir, exist_ok=True)
 
-    results = []
-    for i, (header, string) in enumerate(fasta_seqs.items()):
-        fold_path = os.path.join(fold_dir, f"sample_{i}.pdb")
+    # ProteinMPNN's FASTA prepends a "template" record — the native-sequence
+    # echo of the input PDB — before the N designed sequences. Its header
+    # lacks the `T=<temp>, sample=N` marker that every design has. Drop it:
+    # it's not a design, folding it wastes a GPU call, and it pollutes the
+    # per-sample CSV.
+    fasta_items = [
+        (h, s) for h, s in fasta_seqs.items()
+        if h.startswith("T=") or ", T=" in h
+    ]
+    expected = seq_per_sample
+    if len(fasta_items) != expected:
+        log.warning(
+            f"Expected {expected} designed sequences from ProteinMPNN, "
+            f"got {len(fasta_items)} after filtering template record."
+        )
+
+    # ---- Folding stage ----
+    # If a batched fold fn was supplied, fold everything in one call.
+    # Otherwise fall back to the legacy per-sequence loop. Both code paths
+    # write PDBs to the same `fold_dir/sample_<i>.pdb` layout so the
+    # downstream metrics loop below is unchanged.
+    if fold_fn_batch is not None:
+        seqs = [s.replace("/", ":") for _, s in fasta_items]
+        paths = [os.path.join(fold_dir, f"sample_{i}.pdb") for i in range(len(fasta_items))]
         try:
-            fold_fn(string.replace("/", ":"), fold_path)
+            fold_fn_batch(seqs, paths)
         except Exception as e:
-            log.warning(f"Folding failed for seq {i}: {e}")
+            log.warning(f"Batched folding failed at the top level: {e}")
+    else:
+        for i, (header, string) in enumerate(fasta_items):
+            fold_path = os.path.join(fold_dir, f"sample_{i}.pdb")
+            try:
+                fold_fn(string.replace("/", ":"), fold_path)
+            except Exception as e:
+                log.warning(f"Folding failed for seq {i}: {e}")
+
+    # ---- Metrics stage ----
+    results = []
+    for i, (header, string) in enumerate(fasta_items):
+        fold_path = os.path.join(fold_dir, f"sample_{i}.pdb")
+        if not os.path.exists(fold_path):
+            log.warning(f"No ESMFold output for seq {i}, skipping metrics")
             continue
 
         try:
